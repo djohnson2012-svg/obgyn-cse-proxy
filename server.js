@@ -1,33 +1,31 @@
 const express = require('express');
-const { createProxyMiddleware } = require('http-proxy-middleware');
 const cors = require('cors');
+const https = require('https');
 const app = express();
 const PORT = process.env.PORT || 3001;
 
-// Allowed hostnames for the proxy
-const ALLOWED_HOSTNAMES = [
-  'localhost',
-  '127.0.0.1',
-  'obgyn-app.com',
-  'staging.obgyn-app.com'
+// Finalized allowlist of approved domains for search filtering
+const ALLOWED_DOMAINS = [
+  'acog.org',
+  'smfm.org', 
+  'sgo.org',
+  'asrm.org',
+  'radiopaedia.org',
+  'perinatology.com',
+  'cdc.gov',
+  'ncbi.nlm.nih.gov',
+  'pmc.ncbi.nlm.nih.gov',
+  'books.ncbi.nlm.nih.gov',
+  'exxcellence.org',
+  'obgproject.com',
+  'creogsovercoffee.com'
 ];
 
 // Enable CORS for all routes
 app.use(cors());
+app.use(express.json());
 
-// Middleware to check hostname allowlist
-function validateHostname(req, res, next) {
-  const hostname = req.hostname || req.get('host')?.split(':')[0];
-  
-  if (!ALLOWED_HOSTNAMES.includes(hostname)) {
-    console.warn(`Blocked request from unauthorized hostname: ${hostname}`);
-    return res.status(403).json({ error: 'Forbidden: Hostname not allowed' });
-  }
-  
-  next();
-}
-
-// Middleware to check API key header
+// Middleware to validate API key (no hostname restrictions for GPT calls)
 function validateApiKey(req, res, next) {
   const apiKey = req.get('X-OBGYNRX-KEY');
   const expectedKey = process.env.OBGYNRX_PROXY_KEY;
@@ -50,72 +48,107 @@ function validateApiKey(req, res, next) {
   next();
 }
 
-// Apply security middleware to all routes except health check
-app.use('/api', validateHostname, validateApiKey);
-app.use('/search', validateHostname, validateApiKey);
+// Helper function to make Google CSE API request
+function makeGoogleCSERequest(query, start = 1) {
+  return new Promise((resolve, reject) => {
+    const apiKey = process.env.GOOGLE_CSE_API_KEY;
+    const cx = process.env.GOOGLE_CSE_CX;
+    
+    if (!apiKey || !cx) {
+      reject(new Error('Google CSE API key or CX not configured'));
+      return;
+    }
+    
+    // Create site restriction for allowed domains
+    const siteRestrict = ALLOWED_DOMAINS.map(domain => `site:${domain}`).join(' OR ');
+    const fullQuery = `(${siteRestrict}) ${query}`;
+    
+    const url = `https://www.googleapis.com/customsearch/v1?key=${apiKey}&cx=${cx}&q=${encodeURIComponent(fullQuery)}&start=${start}`;
+    
+    https.get(url, (response) => {
+      let data = '';
+      
+      response.on('data', (chunk) => {
+        data += chunk;
+      });
+      
+      response.on('end', () => {
+        try {
+          const parsed = JSON.parse(data);
+          resolve(parsed);
+        } catch (error) {
+          reject(new Error('Failed to parse Google CSE response'));
+        }
+      });
+    }).on('error', (error) => {
+      reject(error);
+    });
+  });
+}
 
-// Proxy middleware configuration
-const proxyOptions = {
-  target: process.env.TARGET_URL || 'https://api.example.com',
-  changeOrigin: true,
-  pathRewrite: {
-    '^/api': '', // Remove /api prefix when forwarding
-  },
-  onError: (err, req, res) => {
-    console.error('Proxy error:', err);
-    res.status(500).send('Proxy error occurred');
-  },
-  onProxyReq: (proxyReq, req, res) => {
-    console.log(`Proxying request: ${req.method} ${req.url}`);
-  },
-};
+// Apply API key validation to search endpoint only
+app.use('/search', validateApiKey);
 
-// Apply proxy middleware to /api routes
-app.use('/api', createProxyMiddleware(proxyOptions));
-
-// Search endpoint implementation
-app.get('/search', (req, res) => {
+// Search endpoint - queries Google CSE with domain filtering
+app.get('/search', async (req, res) => {
   const { q, limit = 10, offset = 0 } = req.query;
   
   if (!q) {
     return res.status(400).json({ error: 'Missing required query parameter: q' });
   }
   
-  // Mock search implementation - replace with actual search logic
-  const mockResults = {
-    query: q,
-    total: 42,
-    limit: parseInt(limit),
-    offset: parseInt(offset),
-    results: [
-      {
-        id: 1,
-        title: `Search result for "${q}"`,
-        description: 'This is a mock search result for demonstration purposes.',
-        url: 'https://example.com/result/1'
-      },
-      {
-        id: 2,
-        title: `Another result for "${q}"`,
-        description: 'This is another mock search result.',
-        url: 'https://example.com/result/2'
-      }
-    ]
-  };
-  
-  console.log(`Search request: query="${q}", limit=${limit}, offset=${offset}`);
-  res.json(mockResults);
+  try {
+    console.log(`Search request: query="${q}", limit=${limit}, offset=${offset}`);
+    
+    // Calculate start parameter for Google CSE (1-based indexing)
+    const start = parseInt(offset) + 1;
+    const maxResults = Math.min(parseInt(limit), 10); // Google CSE max is 10 per request
+    
+    const cseResponse = await makeGoogleCSERequest(q, start);
+    
+    // Transform Google CSE response to our format
+    const results = {
+      query: q,
+      total: cseResponse.searchInformation?.totalResults ? parseInt(cseResponse.searchInformation.totalResults) : 0,
+      limit: maxResults,
+      offset: parseInt(offset),
+      allowedDomains: ALLOWED_DOMAINS,
+      results: (cseResponse.items || []).slice(0, maxResults).map((item, index) => ({
+        id: parseInt(offset) + index + 1,
+        title: item.title,
+        description: item.snippet,
+        url: item.link,
+        domain: new URL(item.link).hostname
+      }))
+    };
+    
+    console.log(`Search completed: ${results.results.length} results returned`);
+    res.json(results);
+  } catch (error) {
+    console.error('Search error:', error.message);
+    res.status(500).json({ 
+      error: 'Search service error',
+      message: error.message,
+      allowedDomains: ALLOWED_DOMAINS
+    });
+  }
 });
 
 // Health check endpoint (no authentication required)
 app.get('/health', (req, res) => {
-  res.status(200).json({ status: 'OK', timestamp: new Date().toISOString() });
+  res.status(200).json({ 
+    status: 'OK', 
+    timestamp: new Date().toISOString(),
+    allowedDomains: ALLOWED_DOMAINS,
+    apiKeyConfigured: !!process.env.OBGYNRX_PROXY_KEY,
+    googleCSEConfigured: !!(process.env.GOOGLE_CSE_API_KEY && process.env.GOOGLE_CSE_CX)
+  });
 });
 
 // Start the server
 app.listen(PORT, () => {
   console.log(`Proxy server running on port ${PORT}`);
-  console.log(`Proxying requests to: ${proxyOptions.target}`);
-  console.log(`Allowed hostnames: ${ALLOWED_HOSTNAMES.join(', ')}`);
-  console.log(`API key protection: ${process.env.OBGYNRX_PROXY_KEY ? 'enabled' : 'DISABLED (set OBGYNRX_PROXY_KEY)'}`);
+  console.log(`Allowed search domains: ${ALLOWED_DOMAINS.join(', ')}`);
+  console.log(`API key protection: ${process.env.OBGYNRX_PROXY_KEY ? 'enabled' : 'DISABLED (set OBGYNRX_PROXY_KEY)'}`); 
+  console.log(`Google CSE integration: ${(process.env.GOOGLE_CSE_API_KEY && process.env.GOOGLE_CSE_CX) ? 'enabled' : 'DISABLED (set GOOGLE_CSE_API_KEY and GOOGLE_CSE_CX)'}`);  
 });

@@ -4,23 +4,6 @@ const https = require('https');
 const app = express();
 const PORT = process.env.PORT || 3001;
 
-// Finalized allowlist of approved domains for search filtering
-const ALLOWED_DOMAINS = [
-  'acog.org',
-  'smfm.org', 
-  'sgo.org',
-  'asrm.org',
-  'radiopaedia.org',
-  'perinatology.com',
-  'cdc.gov',
-  'ncbi.nlm.nih.gov',
-  'pmc.ncbi.nlm.nih.gov',
-  'books.ncbi.nlm.nih.gov',
-  'exxcellence.org',
-  'obgproject.com',
-  'creogsovercoffee.com'
-];
-
 // Enable CORS for all routes
 app.use(cors());
 app.use(express.json());
@@ -59,42 +42,77 @@ function makeGoogleCSERequest(query, start = 1) {
       return;
     }
     
-    // Create site restriction for allowed domains
-    const siteRestrict = ALLOWED_DOMAINS.map(domain => `site:${domain}`).join(' OR ');
-    const fullQuery = `(${siteRestrict}) ${query}`;
+    const siteRestrict = Array.from(ALLOW).map(domain => `site:${domain}`).join(' OR ');
+    const encodedQuery = encodeURIComponent(`${query} (${siteRestrict})`);
+    const url = `https://www.googleapis.com/customsearch/v1?key=${apiKey}&cx=${cx}&q=${encodedQuery}&start=${start}&num=10`;
     
-    const url = `https://www.googleapis.com/customsearch/v1?key=${apiKey}&cx=${cx}&q=${encodeURIComponent(fullQuery)}&start=${start}`;
+    console.log(`Making Google CSE request: ${url}`);
     
-    https.get(url, (response) => {
+    https.get(url, (res) => {
       let data = '';
       
-      response.on('data', (chunk) => {
+      res.on('data', (chunk) => {
         data += chunk;
       });
       
-      response.on('end', () => {
+      res.on('end', () => {
         try {
-          const parsed = JSON.parse(data);
-          resolve(parsed);
-        } catch (error) {
-          reject(new Error('Failed to parse Google CSE response'));
+          const result = JSON.parse(data);
+          if (result.error) {
+            console.error('Google CSE API error:', result.error);
+            reject(new Error(`Google CSE API error: ${result.error.message}`));
+          } else {
+            resolve(result);
+          }
+        } catch (parseError) {
+          console.error('Failed to parse Google CSE response:', parseError);
+          reject(new Error('Failed to parse search results'));
         }
       });
-    }).on('error', (error) => {
-      reject(error);
+    }).on('error', (err) => {
+      console.error('Google CSE request failed:', err);
+      reject(new Error('Search service unavailable'));
     });
   });
 }
 
-// Apply API key validation to search endpoint only
-app.use('/search', validateApiKey);
+// Allowlist Set placed above /search handler as requested
+const ALLOW = new Set([
+  'acog.org',
+  'www.acog.org',
+  'smfm.org',
+  'www.smfm.org',
+  'sgo.org',
+  'www.sgo.org',
+  'asrm.org',
+  'www.asrm.org',
+  'radiopaedia.org',
+  'www.radiopaedia.org',
+  'perinatology.com',
+  'www.perinatology.com',
+  'cdc.gov',
+  'www.cdc.gov',
+  'ncbi.nlm.nih.gov',
+  'www.ncbi.nlm.nih.gov',
+  'pmc.ncbi.nlm.nih.gov',
+  'books.ncbi.nlm.nih.gov',
+  'exxcellence.org',
+  'www.exxcellence.org',
+  'obgproject.com',
+  'www.obgproject.com',
+  'creogsovercoffee.com',
+  'www.creogsovercoffee.com'
+]);
 
-// Search endpoint - queries Google CSE with domain filtering
-app.get('/search', async (req, res) => {
+// Search endpoint with API key validation
+app.get('/search', validateApiKey, async (req, res) => {
   const { q, limit = 10, offset = 0 } = req.query;
   
-  if (!q) {
-    return res.status(400).json({ error: 'Missing required query parameter: q' });
+  if (!q || typeof q !== 'string' || q.trim().length === 0) {
+    return res.status(400).json({ 
+      error: 'Query parameter "q" is required and must be a non-empty string',
+      allowedDomains: Array.from(ALLOW)
+    });
   }
   
   try {
@@ -112,7 +130,7 @@ app.get('/search', async (req, res) => {
       total: cseResponse.searchInformation?.totalResults ? parseInt(cseResponse.searchInformation.totalResults) : 0,
       limit: maxResults,
       offset: parseInt(offset),
-      allowedDomains: ALLOWED_DOMAINS,
+      allowedDomains: Array.from(ALLOW),
       results: (cseResponse.items || []).slice(0, maxResults).map((item, index) => ({
         id: parseInt(offset) + index + 1,
         title: item.title,
@@ -129,7 +147,7 @@ app.get('/search', async (req, res) => {
     res.status(500).json({ 
       error: 'Search service error',
       message: error.message,
-      allowedDomains: ALLOWED_DOMAINS
+      allowedDomains: Array.from(ALLOW)
     });
   }
 });
@@ -139,7 +157,7 @@ app.get('/health', (req, res) => {
   res.status(200).json({ 
     status: 'OK', 
     timestamp: new Date().toISOString(),
-    allowedDomains: ALLOWED_DOMAINS,
+    allowedDomains: Array.from(ALLOW),
     apiKeyConfigured: !!process.env.OBGYNRX_PROXY_KEY,
     googleCSEConfigured: !!(process.env.GOOGLE_CSE_API_KEY && process.env.GOOGLE_CSE_CX)
   });
@@ -148,7 +166,7 @@ app.get('/health', (req, res) => {
 // Start the server
 app.listen(PORT, () => {
   console.log(`Proxy server running on port ${PORT}`);
-  console.log(`Allowed search domains: ${ALLOWED_DOMAINS.join(', ')}`);
-  console.log(`API key protection: ${process.env.OBGYNRX_PROXY_KEY ? 'enabled' : 'DISABLED (set OBGYNRX_PROXY_KEY)'}`); 
-  console.log(`Google CSE integration: ${(process.env.GOOGLE_CSE_API_KEY && process.env.GOOGLE_CSE_CX) ? 'enabled' : 'DISABLED (set GOOGLE_CSE_API_KEY and GOOGLE_CSE_CX)'}`);  
+  console.log(`Allowed search domains: ${Array.from(ALLOW).join(', ')}`);
+  console.log(`API key protection: ${process.env.OBGYNRX_PROXY_KEY ? 'enabled' : 'DISABLED (set OBGYNRX_PROXY_KEY)'}`);
+  console.log(`Google CSE integration: ${(process.env.GOOGLE_CSE_API_KEY && process.env.GOOGLE_CSE_CX) ? 'enabled' : 'DISABLED (set GOOGLE_CSE_API_KEY and GOOGLE_CSE_CX)'}`);
 });
